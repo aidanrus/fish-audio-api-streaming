@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JanitorAI Hackathon Test</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      background-color: #121212;
+      color: #f1f1f1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+    textarea {
+      width: 90%;
+      max-width: 600px;
+      height: 100px;
+      margin-bottom: 1rem;
+      padding: 0.5rem;
+      font-size: 1rem;
+      border-radius: 8px;
+      border: none;
+      outline: none;
+    }
+    button {
+      background-color: #5865f2;
+      color: white;
+      border: none;
+      padding: 0.6rem 1.2rem;
+      font-size: 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    #response {
+      margin-top: 1.5rem;
+      width: 90%;
+      max-width: 600px;
+      white-space: pre-wrap;
+      background-color: #1e1e1e;
+      padding: 1rem;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h2>API test</h2>
+  <textarea id="input" placeholder="Type your message..."></textarea><br />
+  <button id="sendBtn">Send to AI</button>
+
+  <div id="response"></div>
+
+  <script>
+const input = document.getElementById("input");
+const button = document.getElementById("sendBtn");
+const output = document.getElementById("response");
+
+const messages = [
+  { role: "system", content: `
+    You are a helpful tutor, that talks in a conversational way, acting as an assistant during a team chatroom. 
+    Users will chat normally, and you only respond when someone says "Friday". 
+    When addressed, respond helpfully but not overly verbose, and then return to <listening> mode after.
+  ` }
+];
+
+let ttsSocket;
+let audioCtx = null;
+let audioQueue = [];
+let isPlaying = false;
+
+// === CONNECT TO FISH AUDIO WEBSOCKET ===
+async function connectTTS() {
+  return new Promise((resolve, reject) => {
+    console.log("🔌 Connecting to Fish Audio WebSocket...");
+    ttsSocket = new WebSocket("ws://localhost:3000/api/fish-tts");
+    ttsSocket.binaryType = "arraybuffer";
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    ttsSocket.onopen = () => {
+      console.log("🎤 Connected to Fish Audio proxy");
+
+      // Start TTS session
+      const startMsg = {
+        type: "start",
+        model: "gpt-4o-mini-tts",
+        voice: "gpt-4o-mini-tts-en_us_female",
+        format: "pcm16",
+        sample_rate: 44100
+      };
+      ttsSocket.send(JSON.stringify(startMsg));
+      console.log("📨 Sent start message to TTS");
+
+      // Send a tiny chunk to ensure the session stays alive
+      ttsSocket.send(JSON.stringify({ type: "text_chunk", text: " " }));
+      console.log("📨 Sent keep-alive text chunk");
+
+      resolve();
+    };
+
+    ttsSocket.onerror = (err) => {
+      console.error("❌ TTS connection error:", err);
+      reject(err);
+    };
+
+    ttsSocket.onclose = (event) => {
+      console.warn("⚠️ TTS WebSocket closed", event.code, event.reason);
+    };
+
+    // Handle incoming PCM16 chunks
+    ttsSocket.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        console.log("📝 TTS message:", event.data);
+        return;
+      }
+
+      audioQueue.push(event.data);
+      if (!isPlaying) playQueue();
+    };
+  });
+}
+
+// === PLAY QUEUED AUDIO ===
+async function playQueue() {
+  if (audioQueue.length === 0) {
+    isPlaying = false;
+    return;
+  }
+
+  isPlaying = true;
+
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+
+  const chunk = audioQueue.shift();
+  const view = new DataView(chunk);
+  const samples = new Float32Array(view.byteLength / 2);
+
+  for (let i = 0; i < samples.length; i++) {
+    samples[i] = view.getInt16(i * 2, true) / 32768;
+  }
+
+  const buffer = audioCtx.createBuffer(1, samples.length, 44100);
+  buffer.copyToChannel(samples, 0);
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioCtx.destination);
+  source.start();
+
+  source.onended = () => playQueue();
+}
+
+// === SEND TO AI + STREAM TEXT + AUDIO ===
+button.onclick = async () => {
+  const userMessage = input.value.trim();
+  if (!userMessage) return;
+
+  console.log("✉️ Button clicked, user message:", userMessage);
+
+  if (!ttsSocket || ttsSocket.readyState !== WebSocket.OPEN) {
+    console.log("⚡ TTS not connected, connecting now...");
+    await connectTTS();
+  }
+
+  messages.push({ role: "user", content: userMessage });
+  output.textContent += `conversation_transcript: ${userMessage}\nAI: `;
+
+  const response = await fetch("http://localhost:3000/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages })
+  });
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let aiMessage = "";
+
+  console.log("📥 Response received, processing stream...");
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value, { stream: true });
+    const lines = chunk.split("\n");
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") {
+        console.log("🏁 AI stream done, sending end signal to TTS");
+
+        if (ttsSocket && ttsSocket.readyState === WebSocket.OPEN) {
+          ttsSocket.send(JSON.stringify({ type: "end" }));
+          console.log("📨 Sent end signal to TTS");
+        }
+        break;
+      }
+
+      try {
+        const json = JSON.parse(data);
+        const delta =
+          json?.choices?.[0]?.delta?.content ??
+          json?.content ??
+          "";
+
+        if (delta) {
+          aiMessage += delta;
+          output.textContent += delta;
+          console.log("💬 AI chunk:", delta);
+
+          if (ttsSocket && ttsSocket.readyState === WebSocket.OPEN) {
+            ttsSocket.send(JSON.stringify({ type: "text_chunk", text: delta }));
+            console.log("📨 Sent text chunk to TTS:", delta);
+          }
+        }
+      } catch (err) {
+        console.error("⚠️ JSON parse error:", err, data);
+      }
+    }
+  }
+
+  messages.push({ role: "assistant", content: aiMessage });
+  input.value = "";
+
+  console.log("📝 Full AI message:", aiMessage);
+  console.log("✅ Stream finished reading");
+};
+</script>
+
+
+
+</body>
+</html>
